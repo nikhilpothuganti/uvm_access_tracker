@@ -1,0 +1,17 @@
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-drv.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-utils.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-crtc.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-encoder.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-connector.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-gem.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-fb.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-modeset.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-prime-fence.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-linux.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-helper.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nv-pci-table.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-gem-nvkms-memory.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-gem-user-memory.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-gem-dma-buf.o
+/usr/src/nvidia-470.256.02/nvidia-drm/nvidia-drm-format.o
