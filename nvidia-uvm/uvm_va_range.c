@@ -30,6 +30,7 @@
 #include "uvm_kvmalloc.h"
 #include "uvm_map_external.h"
 #include "uvm_perf_thrashing.h"
+#include "uvm_sampling_tracker.h"
 #include "nv_uvm_interface.h"
 
 static struct kmem_cache *g_uvm_va_range_cache __read_mostly;
@@ -145,6 +146,8 @@ static uvm_va_range_t *uvm_va_range_alloc_managed(uvm_va_space_t *va_space, NvU6
         UVM_DBG_PRINT("Failed to allocate %zu blocks\n", uvm_va_range_num_blocks(va_range));
         goto error;
     }
+
+    uvm_sampling_tracker_init_va_range(va_range);
 
     return va_range;
 
@@ -484,6 +487,7 @@ void uvm_va_range_destroy(uvm_va_range_t *va_range, struct list_head *deferred_f
                            va_range->node.start, va_range->node.end, va_range->type);
     }
 
+    uvm_sampling_tracker_destroy_va_range(va_range);
     kmem_cache_free(g_uvm_va_range_cache, va_range);
 }
 
@@ -1060,6 +1064,7 @@ NV_STATUS uvm_va_range_split(uvm_va_range_t *existing_va_range,
 
     // Finally, update the VA range tree
     uvm_range_tree_split(&va_space->va_range_tree, &existing_va_range->node, &new->node);
+    uvm_sampling_tracker_reset_va_range(existing_va_range);
 
     if (new->type == UVM_VA_RANGE_TYPE_MANAGED) {
         event_data.range_shrink.range = new;
@@ -1978,4 +1983,3 @@ out:
     uvm_va_space_up_write(va_space);
     return status;
 }
-

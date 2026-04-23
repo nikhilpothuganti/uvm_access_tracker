@@ -189,6 +189,7 @@ NV_STATUS uvm_va_space_create(struct inode *inode, struct file *filp)
     filp->f_mapping = &va_space->mapping;
 
     va_space->test.page_prefetch_enabled = true;
+    uvm_sampling_tracker_init_va_space(va_space);
 
     init_tools_data(va_space);
 
@@ -219,6 +220,7 @@ fail:
     uvm_perf_destroy_va_space_events(&va_space->perf_events);
     uvm_va_space_up_write(va_space);
 
+    uvm_sampling_tracker_destroy_va_space(va_space);
     uvm_kvfree(va_space);
 
     return status;
@@ -367,12 +369,6 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
     list_del(&va_space->list_node);
     uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
 
-    // Clear the tracker's va_space pointer if it points to this VA space.
-    // Prevents uvm_tracking_revoke_epoch() from dereferencing a freed pointer
-    // after the process exits.
-    if (g_tracker && READ_ONCE(g_tracker->va_space) == (void *)va_space)
-        WRITE_ONCE(g_tracker->va_space, NULL);
-
     uvm_perf_heuristics_stop(va_space);
 
     // Stop all channels before unmapping anything. This kills the channels and
@@ -516,6 +512,7 @@ void uvm_va_space_destroy(uvm_va_space_t *va_space)
 
     uvm_mutex_unlock(&g_uvm_global.global_lock);
 
+    uvm_sampling_tracker_destroy_va_space(va_space);
     uvm_kvfree(va_space);
 }
 

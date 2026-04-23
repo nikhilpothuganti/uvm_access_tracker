@@ -1,89 +1,88 @@
 #ifndef UVM_SAMPLING_TRACKER_H
 #define UVM_SAMPLING_TRACKER_H
 
+#include "uvm_forward_decl.h"
+
 #include <linux/bitmap.h>
 #include <linux/types.h>
 
-#define UVM_TRACKER_BITMAP_PAGES  (1UL << 21)  /* 2M pages — 256 KB bitmap  */
-#define UVM_TRACKER_RECORD_PAGES  (1UL << 17)  /* 128K pages — 512 MB range */
+#define UVM_TRACKER_RECORD_PAGES  (1UL << 17)  /* 128K sampled metadata slots */
 
 /*
- * Per-page first-access record.
+ * Per-record first-access metadata.
  *
- * Written at most once per epoch under a cmpxchg on the epoch field
- * (first-write-wins).  Readers check epoch == g_tracker->epoch before
- * trusting the other fields.
- *
- * Layout: 20 bytes, padded to 24 by the compiler for u64 alignment in arrays.
+ * Each record represents one stride-sampled region within a VA range. The
+ * record stores the first access metadata seen in the current epoch and a
+ * bitmask of all access types observed for that region.
  */
 typedef struct {
-    u64 timestamp_ns;   /* ktime_get_ns() of first access this epoch */
-    u32 pid;            /* tgid of the first faulting process         */
-    u32 epoch;          /* epoch counter when this record was written */
-    u8  access_type;    /* UVM_FAULT_ACCESS_TYPE_* value (cast to u8) */
-    u8  _pad[3];
+    u64 timestamp_ns;      /* ktime_get_ns() of first access this epoch */
+    u32 pid;               /* tgid of the first faulting process         */
+    u32 epoch;             /* epoch counter when this record was written */
+    u32 access_type_mask;  /* bitmask of UVM_FAULT_ACCESS_TYPE_* bits    */
 } uvm_page_record_t;
 
-typedef struct {
-    /*
-     * Tier 1 — fast bitmap.
-     * set_bit() on every fault, covers all 2 M pages.
-     * Cleared on revoke (256 KB memset).
-     */
+struct uvm_va_space_tracker_struct
+{
+    uvm_va_space_t *va_space;
+    u32 epoch;
+    pid_t pid;
+    int active;
+    u32 sample_rate;
+    u32 gpu_id_val;
+};
+
+struct uvm_va_range_tracker_struct
+{
+    uvm_va_range_t     *va_range;
     unsigned long      *bitmap;
-    unsigned long       num_pages;      /* = UVM_TRACKER_BITMAP_PAGES */
-
-    /*
-     * Tier 2 — rich per-page first-access metadata.
-     * Only written for the first access per page per epoch.
-     * Never memset — epoch stamp makes stale entries invisible.
-     * Covers up to UVM_TRACKER_RECORD_PAGES (128K pages = 512 MB).
-     */
+    unsigned long       nr_pages;
     uvm_page_record_t  *records;
+    unsigned long       nr_record_pages;
+    unsigned long       stride;
+};
 
-    /*
-     * Epoch counter.  Incremented on each revoke (O(1)).
-     * Starts at 1 so that zero-initialised records are always "stale".
-     */
-    u32                 epoch;
+static inline u32 uvm_sampling_tracker_access_type_mask(u8 access_type)
+{
+    if (access_type >= 32)
+        return 0;
 
-    /* VA space and GPU context for the revoke sweep */
-    void               *va_space;       /* uvm_va_space_t *, opaque   */
-    u32                 gpu_id_val;
+    return 1U << access_type;
+}
 
-    int                 active;
-    pid_t               pid;
+static inline unsigned long uvm_sampling_tracker_record_index(const uvm_va_range_tracker_t *range_tracker,
+                                                              unsigned long page_index)
+{
+    unsigned long record_index;
 
-    /*
-     * Block sampling rate.  Only 1-in-sample_rate VA blocks suppress prefetch
-     * and get page-level fault tracking.  The sampled block is chosen
-     * deterministically by (block_start >> 21) % sample_rate == 0.
-     *
-     *   sample_rate == 1  →  every block is tracked  (default)
-     *   sample_rate == 256 →  1 in 256 blocks tracked
-     *   sample_rate == 0  →  no blocks tracked (effectively disables tracker)
-     */
-    u32                 sample_rate;
-} gpu_sampling_tracker_t;
+    if (!range_tracker || range_tracker->nr_record_pages == 0)
+        return 0;
 
-extern gpu_sampling_tracker_t *g_tracker;
+    record_index = page_index / range_tracker->stride;
+    if (record_index >= range_tracker->nr_record_pages)
+        record_index = range_tracker->nr_record_pages - 1;
+
+    return record_index;
+}
 
 /*
  * Returns true if the VA block whose allocation starts at block_start should
- * have prefetch suppressed and its faults recorded.  Safe to call from any
- * context; reads g_tracker fields with READ_ONCE.
+ * have prefetch suppressed and its faults recorded. Safe to call from any
+ * context; reads the per-VA-space state locklessly.
  *
  * UVM_VA_BLOCK_BITS (21) is used directly to avoid a circular header
  * dependency on uvm_va_block_types.h.
  */
-static inline bool uvm_sampling_tracker_block_sampled(unsigned long block_start)
+static inline bool uvm_sampling_tracker_block_sampled(uvm_va_space_tracker_t *space_tracker,
+                                                      uvm_va_range_tracker_t *range_tracker,
+                                                      unsigned long block_start)
 {
     u32 rate;
 
-    if (!g_tracker || !READ_ONCE(g_tracker->active))
+    if (!space_tracker || !range_tracker || !READ_ONCE(space_tracker->active))
         return false;
 
-    rate = READ_ONCE(g_tracker->sample_rate);
+    rate = READ_ONCE(space_tracker->sample_rate);
     if (rate == 0)
         return false;
     if (rate == 1)
@@ -92,20 +91,28 @@ static inline bool uvm_sampling_tracker_block_sampled(unsigned long block_start)
     return ((block_start >> 21) % rate) == 0;
 }
 
-/*
- * Record one GPU fault.
- *   addr       — faulting virtual address
- *   base_va    — start of the tracked allocation (va_range->node.start)
- *   region_end — exclusive end of the allocation (va_range->node.end + 1)
- *   access_type — UVM_FAULT_ACCESS_TYPE_* cast to u8 by caller
- */
-void uvm_sampling_tracker_record(unsigned long addr,
-                                  unsigned long base_va,
-                                  unsigned long region_end,
-                                  u8 access_type);
+static inline void uvm_sampling_tracker_set_context(uvm_va_space_tracker_t *space_tracker, u32 gpu_id_val)
+{
+    if (space_tracker)
+        WRITE_ONCE(space_tracker->gpu_id_val, gpu_id_val);
+}
 
-/* Register the VA space and GPU targeted by revoke epochs. */
-void uvm_sampling_tracker_set_context(void *va_space, u32 gpu_id_val);
+int uvm_sampling_tracker_default_active(void);
+u32 uvm_sampling_tracker_default_sample_rate(void);
+void uvm_sampling_tracker_set_default_active(int active);
+void uvm_sampling_tracker_set_default_sample_rate(u32 sample_rate);
+
+void uvm_sampling_tracker_init_va_space(uvm_va_space_t *va_space);
+void uvm_sampling_tracker_destroy_va_space(uvm_va_space_t *va_space);
+void uvm_sampling_tracker_init_va_range(uvm_va_range_t *va_range);
+void uvm_sampling_tracker_destroy_va_range(uvm_va_range_t *va_range);
+void uvm_sampling_tracker_reset_va_range(uvm_va_range_t *va_range);
+
+void uvm_sampling_tracker_record(uvm_va_space_tracker_t *space_tracker,
+                                 uvm_va_range_tracker_t *range_tracker,
+                                 unsigned long addr,
+                                 unsigned long base_va,
+                                 u8 access_type);
 
 void uvm_sampling_tracker_init(void);
 void uvm_sampling_tracker_destroy(void);

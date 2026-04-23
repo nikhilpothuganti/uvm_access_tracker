@@ -387,6 +387,9 @@ struct uvm_va_range_struct
     //       them all at range allocation.
     atomic_long_t *blocks;
 
+    // Optional per-range sampling state. Only managed ranges allocate it.
+    uvm_va_range_tracker_t *sampling_tracker;
+
     uvm_va_range_type_t type;
     union
     {

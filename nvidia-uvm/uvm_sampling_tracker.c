@@ -1,10 +1,12 @@
 #include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/vmalloc.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
 #include <linux/sched.h>
+
 #include "uvm_sampling_tracker.h"
+#include "uvm_kvmalloc.h"
+#include "uvm_va_range.h"
+#include "uvm_va_space.h"
 
 /* ktime_get_ns() calls ktime_get() which is EXPORT_SYMBOL_GPL; use the
  * non-GPL ktime_get_raw_ts64 path so proprietary modules can load. */
@@ -15,138 +17,219 @@ static inline u64 uvm_ktime_get_ns(void)
     return timespec64_to_ns(&ts);
 }
 
-gpu_sampling_tracker_t *g_tracker = NULL;
-
-void uvm_sampling_tracker_set_context(void *va_space, u32 gpu_id_val)
+typedef struct
 {
-    if (!g_tracker)
+    int active;
+    u32 sample_rate;
+} uvm_sampling_tracker_defaults_t;
+
+static uvm_sampling_tracker_defaults_t g_sampling_tracker_defaults = {
+    .active = 1,
+    .sample_rate = 1,
+};
+
+static void uvm_sampling_tracker_update_access_mask(uvm_page_record_t *rec, u32 access_type_mask)
+{
+    u32 old_mask;
+    u32 new_mask;
+
+    if (!access_type_mask)
         return;
-    WRITE_ONCE(g_tracker->va_space,   va_space);
-    WRITE_ONCE(g_tracker->gpu_id_val, gpu_id_val);
+
+    do {
+        old_mask = READ_ONCE(rec->access_type_mask);
+        new_mask = old_mask | access_type_mask;
+        if (new_mask == old_mask)
+            return;
+    } while (cmpxchg(&rec->access_type_mask, old_mask, new_mask) != old_mask);
 }
 
-void uvm_sampling_tracker_record(unsigned long addr,
-                                  unsigned long base_va,
-                                  unsigned long region_end,
-                                  u8 access_type)
+static void uvm_sampling_tracker_free_range_tracker(uvm_va_range_tracker_t *range_tracker)
 {
-    unsigned long      page_index;
-    uvm_page_record_t *rec;
-    u32                cur_epoch, old_epoch;
-
-    if (!g_tracker || !g_tracker->active)
-        return;
-    if (addr < base_va || addr >= region_end)
+    if (!range_tracker)
         return;
 
-    page_index = (addr - base_va) >> PAGE_SHIFT;
+    uvm_kvfree(range_tracker->records);
+    uvm_kvfree(range_tracker->bitmap);
+    uvm_kvfree(range_tracker);
+}
 
-    /* ── Tier 1: fast bitmap (all 2 M pages) ─────────────────────────── */
-    if (page_index >= g_tracker->num_pages)
+static uvm_va_range_tracker_t *uvm_sampling_tracker_alloc_range_tracker(uvm_va_range_t *va_range)
+{
+    uvm_va_range_tracker_t *range_tracker;
+    unsigned long nr_pages = uvm_va_range_size(va_range) >> PAGE_SHIFT;
+    unsigned long nr_record_pages = min(nr_pages, (unsigned long)UVM_TRACKER_RECORD_PAGES);
+    size_t bitmap_bytes;
+    size_t record_bytes;
+
+    if (nr_pages == 0)
+        return NULL;
+
+    range_tracker = uvm_kvmalloc_zero(sizeof(*range_tracker));
+    if (!range_tracker)
+        return NULL;
+
+    bitmap_bytes = BITS_TO_LONGS(nr_pages) * sizeof(range_tracker->bitmap[0]);
+    record_bytes = nr_record_pages * sizeof(range_tracker->records[0]);
+
+    range_tracker->bitmap = uvm_kvmalloc_zero(bitmap_bytes);
+    if (!range_tracker->bitmap)
+        goto error;
+
+    range_tracker->records = uvm_kvmalloc_zero(record_bytes);
+    if (!range_tracker->records)
+        goto error;
+
+    range_tracker->va_range = va_range;
+    range_tracker->nr_pages = nr_pages;
+    range_tracker->nr_record_pages = nr_record_pages;
+    range_tracker->stride = DIV_ROUND_UP(nr_pages, nr_record_pages);
+    if (range_tracker->stride == 0)
+        range_tracker->stride = 1;
+
+    return range_tracker;
+
+error:
+    uvm_sampling_tracker_free_range_tracker(range_tracker);
+    return NULL;
+}
+
+int uvm_sampling_tracker_default_active(void)
+{
+    return READ_ONCE(g_sampling_tracker_defaults.active);
+}
+
+u32 uvm_sampling_tracker_default_sample_rate(void)
+{
+    return READ_ONCE(g_sampling_tracker_defaults.sample_rate);
+}
+
+void uvm_sampling_tracker_set_default_active(int active)
+{
+    WRITE_ONCE(g_sampling_tracker_defaults.active, !!active);
+}
+
+void uvm_sampling_tracker_set_default_sample_rate(u32 sample_rate)
+{
+    WRITE_ONCE(g_sampling_tracker_defaults.sample_rate, sample_rate);
+}
+
+void uvm_sampling_tracker_init_va_space(uvm_va_space_t *va_space)
+{
+    uvm_va_space_tracker_t *space_tracker;
+
+    if (!va_space || va_space->sampling_tracker)
         return;
 
-    set_bit(page_index, g_tracker->bitmap);
-
-    /* ── Tier 2: rich metadata (first 512 MB = 128 K pages) ──────────── */
-    if (page_index >= UVM_TRACKER_RECORD_PAGES)
-        return;
-
-    cur_epoch = READ_ONCE(g_tracker->epoch);
-    rec       = &g_tracker->records[page_index];
-    old_epoch = READ_ONCE(rec->epoch);
-
-    /*
-     * Page already recorded this epoch: check if the incoming access is
-     * more intrusive than what's stored and upgrade if so.
-     *
-     * UVM intrusion order: PREFETCH(0) < READ(1) < WRITE(2)
-     *                       < ATOMIC_WEAK(3) < ATOMIC_STRONG(4)
-     *
-     * Example: page first faulted as READ (PTE restored RO), then the GPU
-     * writes it — a second fault fires with access_type=WRITE.  The cmpxchg
-     * below would fail (epoch already set), but without this upgrade the
-     * record would permanently show "read" even though the page was written.
-     *
-     * Single-byte WRITE_ONCE on x86 is naturally atomic — no torn write.
-     * A benign race between two upgrading CPUs leaves one valid value.
-     */
-    if (old_epoch == cur_epoch) {
-        if (access_type > READ_ONCE(rec->access_type))
-            WRITE_ONCE(rec->access_type, access_type);
+    space_tracker = uvm_kvmalloc_zero(sizeof(*space_tracker));
+    if (!space_tracker) {
+        pr_err("[tracker] failed to allocate VA space tracker for %px\n", va_space);
         return;
     }
 
-    /*
-     * First access this epoch: atomically claim the slot.
-     * Only one CPU succeeds; all others fall into the upgrade path above
-     * on their next call once rec->epoch == cur_epoch.
-     *
-     * Minor benign race: a concurrent procfs reader may observe
-     * rec->epoch == cur_epoch before the fields below are written.
-     * Worst case the reader sees the previous epoch's pid/timestamp
-     * for one read cycle — acceptable for a sampling tracker.
-     */
-    if (cmpxchg(&rec->epoch, old_epoch, cur_epoch) != old_epoch)
+    space_tracker->va_space = va_space;
+    space_tracker->epoch = 1;
+    space_tracker->pid = task_tgid_nr(current);
+    space_tracker->active = uvm_sampling_tracker_default_active();
+    space_tracker->sample_rate = uvm_sampling_tracker_default_sample_rate();
+    space_tracker->gpu_id_val = UVM_ID_INVALID.val;
+
+    va_space->sampling_tracker = space_tracker;
+}
+
+void uvm_sampling_tracker_destroy_va_space(uvm_va_space_t *va_space)
+{
+    if (!va_space)
         return;
 
+    uvm_kvfree(va_space->sampling_tracker);
+    va_space->sampling_tracker = NULL;
+}
+
+void uvm_sampling_tracker_init_va_range(uvm_va_range_t *va_range)
+{
+    if (!va_range || va_range->sampling_tracker || va_range->type != UVM_VA_RANGE_TYPE_MANAGED)
+        return;
+
+    va_range->sampling_tracker = uvm_sampling_tracker_alloc_range_tracker(va_range);
+    if (!va_range->sampling_tracker) {
+        pr_err("[tracker] failed to allocate range tracker for [0x%llx, 0x%llx]\n",
+               va_range->node.start,
+               va_range->node.end);
+    }
+}
+
+void uvm_sampling_tracker_destroy_va_range(uvm_va_range_t *va_range)
+{
+    if (!va_range)
+        return;
+
+    uvm_sampling_tracker_free_range_tracker(va_range->sampling_tracker);
+    va_range->sampling_tracker = NULL;
+}
+
+void uvm_sampling_tracker_reset_va_range(uvm_va_range_t *va_range)
+{
+    uvm_sampling_tracker_destroy_va_range(va_range);
+    uvm_sampling_tracker_init_va_range(va_range);
+}
+
+void uvm_sampling_tracker_record(uvm_va_space_tracker_t *space_tracker,
+                                 uvm_va_range_tracker_t *range_tracker,
+                                 unsigned long addr,
+                                 unsigned long base_va,
+                                 u8 access_type)
+{
+    unsigned long page_index;
+    unsigned long record_index;
+    uvm_page_record_t *rec;
+    u32 cur_epoch;
+    u32 old_epoch;
+    u32 access_type_mask;
+
+    if (!space_tracker || !range_tracker || !READ_ONCE(space_tracker->active))
+        return;
+    if (addr < base_va)
+        return;
+
+    page_index = (addr - base_va) >> PAGE_SHIFT;
+    if (page_index >= range_tracker->nr_pages)
+        return;
+
+    set_bit(page_index, range_tracker->bitmap);
+
+    record_index = uvm_sampling_tracker_record_index(range_tracker, page_index);
+    rec = &range_tracker->records[record_index];
+    cur_epoch = READ_ONCE(space_tracker->epoch);
+    old_epoch = READ_ONCE(rec->epoch);
+    access_type_mask = uvm_sampling_tracker_access_type_mask(access_type);
+
+    if (old_epoch == cur_epoch) {
+        uvm_sampling_tracker_update_access_mask(rec, access_type_mask);
+        return;
+    }
+
+    if (cmpxchg(&rec->epoch, old_epoch, cur_epoch) != old_epoch) {
+        if (READ_ONCE(rec->epoch) == cur_epoch)
+            uvm_sampling_tracker_update_access_mask(rec, access_type_mask);
+        return;
+    }
+
     WRITE_ONCE(rec->timestamp_ns, uvm_ktime_get_ns());
-    WRITE_ONCE(rec->pid,          (u32)task_tgid_nr(current));
-    WRITE_ONCE(rec->access_type,  access_type);
+    WRITE_ONCE(rec->pid, (u32)task_tgid_nr(current));
+    WRITE_ONCE(rec->access_type_mask, access_type_mask);
 }
 
 void uvm_sampling_tracker_init(void)
 {
-    size_t bitmap_bytes = BITS_TO_LONGS(UVM_TRACKER_BITMAP_PAGES) * sizeof(long);
-    size_t record_bytes = UVM_TRACKER_RECORD_PAGES * sizeof(uvm_page_record_t);
+    uvm_sampling_tracker_set_default_active(1);
+    uvm_sampling_tracker_set_default_sample_rate(1);
 
-    g_tracker = kzalloc(sizeof(*g_tracker), GFP_KERNEL);
-    if (!g_tracker) {
-        pr_err("[tracker] failed to allocate tracker struct\n");
-        return;
-    }
-
-    g_tracker->bitmap = kzalloc(bitmap_bytes, GFP_KERNEL);
-    if (!g_tracker->bitmap) {
-        pr_err("[tracker] failed to allocate bitmap (%zu KB)\n",
-               bitmap_bytes / 1024);
-        goto err_free_tracker;
-    }
-
-    /*
-     * records is ~3 MB — use vzalloc so it doesn't need to be physically
-     * contiguous (kzalloc limit is ~4 MB but fragmentation can make it fail).
-     */
-    g_tracker->records = vzalloc(record_bytes);
-    if (!g_tracker->records) {
-        pr_err("[tracker] failed to allocate records (%zu KB)\n",
-               record_bytes / 1024);
-        goto err_free_bitmap;
-    }
-
-    g_tracker->num_pages   = UVM_TRACKER_BITMAP_PAGES;
-    g_tracker->epoch       = 1;   /* 0 is the "never written" sentinel */
-    g_tracker->active      = 1;
-    g_tracker->sample_rate = 1;   /* default: track every block */
-
-    uvm_sampling_procfs_init();
-    pr_info("[tracker] initialized — bitmap %zu KB, records %zu KB\n",
-            bitmap_bytes / 1024, record_bytes / 1024);
-    return;
-
-err_free_bitmap:
-    kfree(g_tracker->bitmap);
-err_free_tracker:
-    kfree(g_tracker);
-    g_tracker = NULL;
+    if (uvm_sampling_procfs_init() != 0)
+        pr_err("[tracker] failed to create procfs entry\n");
 }
 
 void uvm_sampling_tracker_destroy(void)
 {
     uvm_sampling_procfs_destroy();
-    if (!g_tracker)
-        return;
-    vfree(g_tracker->records);
-    kfree(g_tracker->bitmap);
-    kfree(g_tracker);
-    g_tracker = NULL;
 }

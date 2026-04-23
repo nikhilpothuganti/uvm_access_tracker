@@ -1155,10 +1155,8 @@ static NV_STATUS service_batch_managed_faults_in_block_locked(uvm_gpu_t *gpu,
     block_context->thrashing_pin_count = 0;
     block_context->read_duplicate_count = 0;
 
-    // Always update va_space so a new CUDA process replaces a stale pointer
-    // left by a process that has since exited.
-    if (g_tracker && g_tracker->active)
-        uvm_sampling_tracker_set_context(va_space, gpu->id.val);
+    if (va_space->sampling_tracker)
+        uvm_sampling_tracker_set_context(va_space->sampling_tracker, gpu->id.val);
 
     uvm_range_group_range_migratability_iter_first(va_space, va_block->start, va_block->end, &iter);
 
@@ -1184,11 +1182,14 @@ static NV_STATUS service_batch_managed_faults_in_block_locked(uvm_gpu_t *gpu,
         uvm_fault_access_type_t service_access_type;
         NvU32 service_access_type_mask;
 
-        if (uvm_sampling_tracker_block_sampled(va_block->start))
+        if (uvm_sampling_tracker_block_sampled(va_space->sampling_tracker,
+                                               va_block->va_range->sampling_tracker,
+                                               va_block->start))
             uvm_sampling_tracker_record(
+                    va_space->sampling_tracker,
+                    va_block->va_range->sampling_tracker,
                     current_entry->fault_address,
                     va_block->va_range->node.start,
-                    va_block->va_range->node.end + 1,
                     (u8)current_entry->fault_access_type);
 
         UVM_ASSERT(current_entry->fault_access_type ==

@@ -9491,7 +9491,9 @@ NV_STATUS uvm_va_block_service_locked(uvm_processor_id_t processor_id,
         // loop.  Both must be suppressed so that prefetch pages are never
         // silently migrated or mapped — every page must fault individually for
         // page-level tracking granularity.
-        if (uvm_sampling_tracker_block_sampled(va_block->start))
+        if (uvm_sampling_tracker_block_sampled(va_block->va_range->va_space->sampling_tracker,
+                                               va_block->va_range->sampling_tracker,
+                                               va_block->start))
             prefetch_hint = UVM_PERF_PREFETCH_HINT_NONE();
 
         if (UVM_ID_IS_VALID(prefetch_hint.residency)) {
@@ -11037,4 +11039,3 @@ out:
     uvm_va_block_context_free(block_context);
     return status;
 }
-

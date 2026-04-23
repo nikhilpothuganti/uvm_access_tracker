@@ -57,6 +57,8 @@ typedef struct uvm_va_block_test_struct uvm_va_block_test_t;
 typedef struct uvm_va_block_wrapper_struct uvm_va_block_wrapper_t;
 typedef struct uvm_va_space_struct uvm_va_space_t;
 typedef struct uvm_va_space_mm_struct uvm_va_space_mm_t;
+typedef struct uvm_va_space_tracker_struct uvm_va_space_tracker_t;
+typedef struct uvm_va_range_tracker_struct uvm_va_range_tracker_t;
 
 typedef struct uvm_make_resident_context_struct uvm_make_resident_context_t;
 
