@@ -5,6 +5,8 @@
 
 #include "uvm_global.h"
 #include "uvm_sampling_tracker.h"
+#include "uvm_va_space.h"
+#include "uvm_va_range.h"
 #include "uvm_va_block.h"
 #include "uvm_processors.h"
 
