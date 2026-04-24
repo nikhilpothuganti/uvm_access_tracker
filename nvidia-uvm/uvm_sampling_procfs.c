@@ -189,8 +189,8 @@ static ssize_t tracker_write(struct file *file,
                              loff_t *ppos)
 {
     char kbuf[64];
-    int val;
     uvm_va_space_t *va_space;
+    ssize_t ret = count;
 
     if (count >= sizeof(kbuf))
         return -EINVAL;
@@ -199,81 +199,126 @@ static ssize_t tracker_write(struct file *file,
 
     kbuf[count] = '\0';
 
+    /* Strip trailing newline/whitespace so both echo and printf work. */
+    while (count > 0 && (kbuf[count - 1] == '\n' || kbuf[count - 1] == '\r' ||
+                          kbuf[count - 1] == ' '))
+        kbuf[--count] = '\0';
+
     mutex_lock(&tracker_lock);
 
     /* sample_rate <N> — 1=all blocks, N=1-in-N, 0=disable */
-    if (strncmp(kbuf, "sample_rate", 11) == 0) {
+    if (strncmp(kbuf, "sample_rate ", 12) == 0) {
         unsigned int uval;
-        if (kstrtouint(kbuf + 12, 10, &uval) == 0) {
-            uvm_sampling_tracker_set_default_sample_rate(uval);
 
-            uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
-            list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
-                if (va_space->sampling_tracker)
-                    WRITE_ONCE(va_space->sampling_tracker->sample_rate, uval);
-            }
-            uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
-
-            pr_info("[tracker] sample_rate=%u\n", uval);
+        if (kstrtouint(kbuf + 12, 10, &uval) != 0) {
+            ret = -EINVAL;
+            goto out;
         }
+        uvm_sampling_tracker_set_default_sample_rate(uval);
+
+        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
+            if (va_space->sampling_tracker)
+                WRITE_ONCE(va_space->sampling_tracker->sample_rate, uval);
+        }
+        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+
+        pr_info("[tracker] sample_rate=%u\n", uval);
     }
     /* enable <0|1> */
-    else if (strncmp(kbuf, "enable", 6) == 0) {
-        if (kstrtoint(kbuf + 7, 10, &val) == 0) {
-            uvm_sampling_tracker_set_default_active(!!val);
+    else if (strncmp(kbuf, "enable ", 7) == 0) {
+        int val;
 
-            uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
-            list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
-                if (va_space->sampling_tracker)
-                    WRITE_ONCE(va_space->sampling_tracker->active, !!val);
-            }
-            uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
-
-            pr_info("[tracker] active=%d\n", !!val);
+        if (kstrtoint(kbuf + 7, 10, &val) != 0) {
+            ret = -EINVAL;
+            goto out;
         }
+        uvm_sampling_tracker_set_default_active(!!val);
+
+        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
+            if (va_space->sampling_tracker)
+                WRITE_ONCE(va_space->sampling_tracker->active, !!val);
+        }
+        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+
+        pr_info("[tracker] active=%d\n", !!val);
     }
-    /* clear — reset bitmaps and bump epochs without revoking GPU PTEs */
-    else if (strncmp(kbuf, "clear", 5) == 0) {
+    /*
+     * clear — reset bitmaps and bump epoch without revoking GPU PTEs.
+     *
+     * Bitmaps are zeroed BEFORE the epoch is bumped. If the epoch were bumped
+     * first, a concurrent fault handler could set a bitmap bit for the new
+     * epoch and bitmap_zero would then clear it — leaving a valid new-epoch
+     * record invisible to for_each_set_bit in the read path.
+     */
+    else if (strcmp(kbuf, "clear") == 0) {
         uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
         list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
             uvm_va_range_t *va_range;
             uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
+            u32 next_epoch;
 
             if (!space_tracker)
                 continue;
 
-            WRITE_ONCE(space_tracker->epoch, READ_ONCE(space_tracker->epoch) + 1);
             uvm_va_space_down_read(va_space);
             uvm_for_each_va_range(va_range, va_space)
                 tracker_clear_range(va_range->sampling_tracker);
             uvm_va_space_up_read(va_space);
+
+            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
+            if (next_epoch == 0)
+                next_epoch = 1;
+            WRITE_ONCE(space_tracker->epoch, next_epoch);
         }
         uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
 
         pr_info("[tracker] cleared all tracked ranges\n");
     }
     /*
-     * revoke — start a new tracking epoch:
-     *   1. bump epoch counters       (O(1) — invalidates all records)
-     *   2. clear all range bitmaps
-     *   3. unmap GPU PTEs            (subsequent accesses fault)
+     * revoke <pid>  — start a new epoch and unmap GPU pages for one process
+     *                 (matched by the tgid stored in space_tracker->pid).
+     * revoke all    — same but across every tracked VA space.
+     *
+     * Order: zero bitmaps first, then bump epoch, then unmap GPU PTEs.
+     * Same reasoning as "clear": bumping before zeroing risks a concurrent
+     * fault writing a new-epoch record whose bitmap bit is then cleared.
      */
-    else if (strncmp(kbuf, "revoke", 6) == 0) {
+    else if (strncmp(kbuf, "revoke ", 7) == 0) {
+        const char *arg = kbuf + 7;
+        bool do_all = (strcmp(arg, "all") == 0);
+        pid_t target_pid = 0;
+
+        if (!do_all) {
+            if (kstrtoint(arg, 10, &target_pid) != 0 || target_pid <= 0) {
+                ret = -EINVAL;
+                goto out;
+            }
+        }
+
         uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
         list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
             uvm_va_range_t *va_range;
             uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
             NV_STATUS status;
             uvm_gpu_id_t gpu_id;
+            u32 next_epoch;
 
             if (!space_tracker)
                 continue;
+            if (!do_all && (pid_t)space_tracker->pid != target_pid)
+                continue;
 
-            WRITE_ONCE(space_tracker->epoch, READ_ONCE(space_tracker->epoch) + 1);
             uvm_va_space_down_read(va_space);
             uvm_for_each_va_range(va_range, va_space)
                 tracker_clear_range(va_range->sampling_tracker);
             uvm_va_space_up_read(va_space);
+
+            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
+            if (next_epoch == 0)
+                next_epoch = 1;
+            WRITE_ONCE(space_tracker->epoch, next_epoch);
 
             if (READ_ONCE(space_tracker->gpu_id_val) == UVM_ID_INVALID.val)
                 continue;
@@ -285,11 +330,18 @@ static ssize_t tracker_write(struct file *file,
         }
         uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
 
-        pr_info("[tracker] revoke completed across tracked VA spaces\n");
+        if (do_all)
+            pr_info("[tracker] revoke all completed\n");
+        else
+            pr_info("[tracker] revoke pid=%d completed\n", target_pid);
+    }
+    else {
+        ret = -EINVAL;
     }
 
+out:
     mutex_unlock(&tracker_lock);
-    return count;
+    return ret;
 }
 
 /* =========================

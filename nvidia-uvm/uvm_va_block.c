@@ -10975,9 +10975,9 @@ void uvm_va_block_mark_cpu_dirty(uvm_va_block_t *va_block)
 //
 // Skips blocks with no GPU read mapping (already unmapped, nothing to do).
 // Caller must hold va_block->lock.
-NV_STATUS uvm_va_block_revoke_write_for_tracking(uvm_va_block_t *va_block,
-                                                  uvm_va_block_context_t *block_context,
-                                                  uvm_gpu_id_t gpu_id)
+NV_STATUS uvm_va_block_unmap_for_tracking(uvm_va_block_t *va_block,
+                                           uvm_va_block_context_t *block_context,
+                                           uvm_gpu_id_t gpu_id)
 {
     uvm_va_block_gpu_state_t *gpu_state;
     uvm_va_block_region_t region;
@@ -11005,9 +11005,10 @@ NV_STATUS uvm_va_block_revoke_write_for_tracking(uvm_va_block_t *va_block,
                               &va_block->tracker);
 }
 
-// Walk every managed VA block in the VA space and revoke GPU write permissions,
-// starting a new tracking epoch. Every subsequent GPU write will fault once,
-// get recorded by the tracker, and have RW restored by the fault handler.
+// Walk every managed VA block in the VA space and fully unmap GPU pages,
+// starting a new tracking epoch. Every subsequent GPU access (read or write)
+// will fault, get recorded by the tracker, and have mappings restored by the
+// fault handler.
 NV_STATUS uvm_tracking_revoke_epoch(uvm_va_space_t *va_space, uvm_gpu_id_t gpu_id)
 {
     uvm_va_range_t *va_range;
@@ -11027,7 +11028,7 @@ NV_STATUS uvm_tracking_revoke_epoch(uvm_va_space_t *va_space, uvm_gpu_id_t gpu_i
 
         for_each_va_block_in_va_range(va_range, va_block) {
             uvm_mutex_lock(&va_block->lock);
-            status = uvm_va_block_revoke_write_for_tracking(va_block, block_context, gpu_id);
+            status = uvm_va_block_unmap_for_tracking(va_block, block_context, gpu_id);
             uvm_mutex_unlock(&va_block->lock);
             if (status != NV_OK)
                 goto out;

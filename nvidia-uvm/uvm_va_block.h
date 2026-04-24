@@ -869,9 +869,9 @@ NV_STATUS uvm_va_block_revoke_prot_mask(uvm_va_block_t *va_block,
 
 // Access tracker: fully unmap all GPU-accessible pages in a block so that
 // any access (read or write) faults and gets recorded. Caller must hold va_block->lock.
-NV_STATUS uvm_va_block_revoke_write_for_tracking(uvm_va_block_t *va_block,
-                                                  uvm_va_block_context_t *block_context,
-                                                  uvm_gpu_id_t gpu_id);
+NV_STATUS uvm_va_block_unmap_for_tracking(uvm_va_block_t *va_block,
+                                           uvm_va_block_context_t *block_context,
+                                           uvm_gpu_id_t gpu_id);
 
 // Sweep all managed VA blocks in va_space and unmap GPU pages,
 // starting a new tracking epoch.
