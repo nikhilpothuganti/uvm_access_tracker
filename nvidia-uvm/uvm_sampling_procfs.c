@@ -2,6 +2,8 @@
 #include <linux/uaccess.h>
 #include <linux/seq_file.h>
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
+#include <linux/timekeeping.h>
 
 #include "uvm_global.h"
 #include "uvm_sampling_tracker.h"
@@ -14,6 +16,20 @@
 
 static struct proc_dir_entry *tracker_proc;
 static DEFINE_MUTEX(tracker_lock);
+
+/* Timed tracking window — auto-stops after track_window <ms> expires. */
+static struct delayed_work g_track_stop_work;
+static atomic_t           g_track_window_active = ATOMIC_INIT(0);
+static u64                g_track_window_end_ns;
+
+/* ktime_get_ns() pulls in ktime_get() which is EXPORT_SYMBOL_GPL and cannot
+ * be called from a proprietary module.  Use ktime_get_raw_ts64 instead. */
+static inline u64 tracker_ktime_ns(void)
+{
+    struct timespec64 ts;
+    ktime_get_raw_ts64(&ts);
+    return timespec64_to_ns(&ts);
+}
 
 /* UVM fault access type names — must match UVM_FAULT_ACCESS_TYPE_* order */
 static const char * const access_type_names[] = {
@@ -46,6 +62,27 @@ static void tracker_clear_range(uvm_va_range_tracker_t *range_tracker)
 {
     if (range_tracker)
         bitmap_zero(range_tracker->bitmap, range_tracker->nr_pages);
+}
+
+/* =========================
+   TIMED WINDOW
+   ========================= */
+
+static void track_stop_fn(struct work_struct *work)
+{
+    uvm_va_space_t *va_space;
+
+    atomic_set(&g_track_window_active, 0);
+    uvm_sampling_tracker_set_default_active(0);
+
+    uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+    list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
+        if (va_space->sampling_tracker)
+            WRITE_ONCE(va_space->sampling_tracker->active, 0);
+    }
+    uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+
+    pr_info("[tracker] track_window expired, tracking stopped\n");
 }
 
 /* =========================
@@ -105,6 +142,17 @@ static int tracker_show(struct seq_file *m, void *v)
                tracked_ranges);
     seq_printf(m, "accessed=%lu (rich_metadata=%lu bitmap_only=%lu)\n",
                n_bitmap, n_rich, n_bitmap - n_rich);
+
+    if (atomic_read(&g_track_window_active)) {
+        u64 now_ns = tracker_ktime_ns();
+        u64 remaining_ms = (now_ns < g_track_window_end_ns)
+                           ? (g_track_window_end_ns - now_ns) / 1000000ULL
+                           : 0;
+        seq_printf(m, "track_window_active=1 track_window_remaining_ms=%llu\n", remaining_ms);
+    } else {
+        seq_puts(m, "track_window_active=0\n");
+    }
+
     seq_puts(m, "---\n");
 
     list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
@@ -335,6 +383,84 @@ static ssize_t tracker_write(struct file *file,
         else
             pr_info("[tracker] revoke pid=%d completed\n", target_pid);
     }
+    /*
+     * track_window <ms> — revoke all GPU mappings, enable tracking, and
+     *                     automatically stop after <ms> milliseconds.
+     *
+     * Any in-progress window is cancelled and replaced. The revoke ensures
+     * every subsequent GPU access faults and is recorded fresh; without it,
+     * already-mapped pages would never re-fault and would be invisible to
+     * the tracker.
+     *
+     * Range: 1–300000 ms (up to 5 minutes).
+     */
+    else if (strncmp(kbuf, "track_window ", 13) == 0) {
+        unsigned int ms;
+        NV_STATUS status;
+        uvm_gpu_id_t gpu_id;
+
+        if (kstrtouint(kbuf + 13, 10, &ms) != 0 || ms == 0 || ms > 300000) {
+            ret = -EINVAL;
+            goto out;
+        }
+
+        /* Cancel any in-progress window (non-blocking; stop_fn holds no locks). */
+        cancel_delayed_work(&g_track_stop_work);
+        atomic_set(&g_track_window_active, 0);
+
+        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
+            uvm_va_range_t *va_range;
+            uvm_va_space_tracker_t *space_tracker = va_space->sampling_tracker;
+            u32 next_epoch;
+
+            if (!space_tracker)
+                continue;
+
+            /* Zero bitmaps before bumping epoch (same race reasoning as clear). */
+            uvm_va_space_down_read(va_space);
+            uvm_for_each_va_range(va_range, va_space)
+                tracker_clear_range(va_range->sampling_tracker);
+            uvm_va_space_up_read(va_space);
+
+            next_epoch = READ_ONCE(space_tracker->epoch) + 1;
+            if (next_epoch == 0)
+                next_epoch = 1;
+            WRITE_ONCE(space_tracker->epoch, next_epoch);
+            WRITE_ONCE(space_tracker->active, 1);
+
+            if (READ_ONCE(space_tracker->gpu_id_val) == UVM_ID_INVALID.val)
+                continue;
+
+            gpu_id = uvm_gpu_id_from_value(READ_ONCE(space_tracker->gpu_id_val));
+            status = uvm_tracking_revoke_epoch(va_space, gpu_id);
+            if (status != NV_OK)
+                pr_err("[tracker] track_window revoke failed for %px: 0x%x\n", va_space, status);
+        }
+        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+
+        uvm_sampling_tracker_set_default_active(1);
+        g_track_window_end_ns = tracker_ktime_ns() + (u64)ms * 1000000ULL;
+        atomic_set(&g_track_window_active, 1);
+        schedule_delayed_work(&g_track_stop_work, msecs_to_jiffies(ms));
+
+        pr_info("[tracker] track_window=%ums started\n", ms);
+    }
+    /* track_stop — cancel any active window and stop tracking immediately. */
+    else if (strcmp(kbuf, "track_stop") == 0) {
+        cancel_delayed_work(&g_track_stop_work);
+        atomic_set(&g_track_window_active, 0);
+        uvm_sampling_tracker_set_default_active(0);
+
+        uvm_mutex_lock(&g_uvm_global.va_spaces.lock);
+        list_for_each_entry(va_space, &g_uvm_global.va_spaces.list, list_node) {
+            if (va_space->sampling_tracker)
+                WRITE_ONCE(va_space->sampling_tracker->active, 0);
+        }
+        uvm_mutex_unlock(&g_uvm_global.va_spaces.lock);
+
+        pr_info("[tracker] track_window stopped manually\n");
+    }
     else {
         ret = -EINVAL;
     }
@@ -362,6 +488,8 @@ static const struct proc_ops tracker_ops = {
 
 int uvm_sampling_procfs_init(void)
 {
+    INIT_DELAYED_WORK(&g_track_stop_work, track_stop_fn);
+
     tracker_proc = proc_create(PROC_NAME, 0666, NULL, &tracker_ops);
     if (!tracker_proc)
         return -ENOMEM;
@@ -371,6 +499,7 @@ int uvm_sampling_procfs_init(void)
 
 void uvm_sampling_procfs_destroy(void)
 {
+    cancel_delayed_work_sync(&g_track_stop_work);
     if (tracker_proc)
         proc_remove(tracker_proc);
 }
