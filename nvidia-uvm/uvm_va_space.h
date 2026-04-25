@@ -201,7 +201,7 @@ struct uvm_va_space_struct
     // Tree of uvm_va_range_t's
     uvm_range_tree_t va_range_tree;
 
-    // Per-process sampling state used by the procfs tracker.
+    // Per-process sampling access tracker.
     uvm_va_space_tracker_t *sampling_tracker;
 
     // Kernel mapping structure passed to unmap_mapping range to unmap CPU PTEs
